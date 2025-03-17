@@ -14,10 +14,11 @@ DB_PASSWORD = "your_db_password"
 # Initialize embedding model
 model = SentenceTransformer('all-mpnet-base-v2')  # Example model, choose as needed
 
-BATCH_SIZE_DOCUMENTS = 50  # Adjust as needed
-BATCH_SIZE_DB = 500       # Adjust as needed
+BATCH_SIZE_DOCUMENTS = 50  # Number of documents to process in each batch
+BATCH_SIZE_DB = 500       # Number of database operations (inserts/updates/deletes) to batch
 
 def connect_to_db():
+    """Establishes a connection to the PostgreSQL database."""
     try:
         conn = psycopg2.connect(
             host=DB_HOST,
@@ -31,6 +32,7 @@ def connect_to_db():
         return None
 
 def process_documents(documents):  # documents is a list of tuples like (page_id, document_text, metadata)
+    """Processes a list of documents, chunking, embedding, and storing them in the database."""
     conn = connect_to_db()
     if not conn:
         return
@@ -38,38 +40,45 @@ def process_documents(documents):  # documents is a list of tuples like (page_id
     try:
         cur = conn.cursor()
 
+        # Iterate through documents in batches
         for i in range(0, len(documents), BATCH_SIZE_DOCUMENTS):
-            document_batch = documents[i:i + BATCH_SIZE_DOCUMENTS]
-            vectors_to_insert = []
-            vectors_to_update = []
-            vectors_to_delete = []
+            document_batch = documents[i:i + BATCH_SIZE_DOCUMENTS] # Get a batch of documents
+            vectors_to_insert = [] # List to store vectors to be inserted
+            vectors_to_update = [] # List to store vectors to be updated
+            vectors_to_delete = [] # List to store chunk_ids of vectors to be deleted
 
+            # Process each document in the batch
             for page_id, document_text, metadata in document_batch:
-                chunks = split_into_sentences(document_text)  # Your chunking function
+                chunks = split_into_sentences(document_text)  # Chunk the document into sentences
 
+                # Retrieve existing chunks for the current document from the database
                 cur.execute("SELECT chunk_id, chunk_index, content_hash FROM embeddings WHERE document_id = %s ORDER BY chunk_index", (page_id,))
                 existing_chunks = cur.fetchall()
-                chunk_hash_map = {row[1]: row[2] for row in existing_chunks}
-                existing_chunk_ids = {row[1]: row[0] for row in existing_chunks}
 
-                chunks_to_delete_indices = set(chunk_hash_map.keys()) - set(range(len(chunks)))
+                # Create dictionaries for efficient lookup of existing chunks
+                chunk_hash_map = {row[1]: row[2] for row in existing_chunks} # chunk_index: content_hash
+                existing_chunk_ids = {row[1]: row[0] for row in existing_chunks} # chunk_index: chunk_id
+
+                # Identify chunks that need to be deleted
+                chunks_to_delete_indices = set(chunk_hash_map.keys()) - set(range(len(chunks))) # Find chunk_indexes that are in the database, but not in the new chunk list.
                 for chunk_index in chunks_to_delete_indices:
-                    vectors_to_delete.append(existing_chunk_ids[chunk_index])
+                    vectors_to_delete.append(existing_chunk_ids[chunk_index]) # Add chunk_id to the delete list
 
+                # Process each chunk in the document
                 for j, chunk_text in enumerate(chunks):
-                    new_hash = hashlib.sha256(chunk_text.encode()).hexdigest()
-                    embedding = model.encode(chunk_text)
+                    new_hash = hashlib.sha256(chunk_text.encode()).hexdigest() # Calculate the hash of the chunk
+                    embedding = model.encode(chunk_text) # Generate the embedding for the chunk
 
-                    if j in chunk_hash_map:  # Update
-                        chunk_id = existing_chunk_ids[j]
-                        stored_hash = chunk_hash_map[j]
-                        if new_hash != stored_hash:
-                            vectors_to_update.append((chunk_id, embedding, json.dumps(metadata | {'content_hash': new_hash}))) # Update the hash in metadata
-                    else:  # Insert
-                        chunk_id = str(uuid.uuid4())
-                        vectors_to_insert.append((chunk_id, page_id, j, new_hash, embedding, json.dumps(metadata | {'content_hash': new_hash})))
+                    if j in chunk_hash_map:  # Chunk already exists (update)
+                        chunk_id = existing_chunk_ids[j] # Get the chunk_id from the existing chunk data
+                        stored_hash = chunk_hash_map[j] # Get the stored hash
+                        if new_hash != stored_hash: # Check if the content has changed
+                            vectors_to_update.append((chunk_id, embedding, json.dumps(metadata | {'content_hash': new_hash}))) # Add the update to the update list.
+                    else:  # New chunk (insert)
+                        chunk_id = str(uuid.uuid4()) # Generate a new UUID
+                        vectors_to_insert.append((chunk_id, page_id, j, new_hash, embedding, json.dumps(metadata | {'content_hash': new_hash}))) # Add the insert to the insert list.
 
-            # Batch operations
+            # Batch operations (insert, update, delete)
             if vectors_to_insert:
                 psycopg2.extras.execute_values(
                     cur,
@@ -78,7 +87,7 @@ def process_documents(documents):  # documents is a list of tuples like (page_id
                     VALUES %s::vector
                     """,
                     vectors_to_insert,
-                    template="""(%(0)s, %(1)s, %(2)s, %(3)s, %(4)s, %(5)s::jsonb)""", # Corrected template
+                    template="""(%(0)s, %(1)s, %(2)s, %(3)s, %(4)s, %(5)s::jsonb)""",
                     page_size=BATCH_SIZE_DB
                 )
 
@@ -91,7 +100,7 @@ def process_documents(documents):  # documents is a list of tuples like (page_id
                     WHERE chunk_id = %s
                     """,
                     [(embedding, metadata, chunk_id) for chunk_id, embedding, metadata in vectors_to_update],
-                    template="""(%(0)s, %(1)s, %(2)s)""", # Corrected template
+                    template="""(%(0)s, %(1)s, %(2)s)""",
                     page_size=BATCH_SIZE_DB
                 )
 
@@ -102,25 +111,23 @@ def process_documents(documents):  # documents is a list of tuples like (page_id
                     DELETE FROM embeddings WHERE chunk_id = %s
                     """,
                     [(chunk_id,) for chunk_id in vectors_to_delete],
-                    template="""(%(0)s)""", # Corrected template
+                    template="""(%(0)s)""",
                     page_size=BATCH_SIZE_DB
                 )
 
-            conn.commit()
+            conn.commit() # Commit the changes for the document batch.
 
     except psycopg2.Error as e:
-        conn.rollback()
+        conn.rollback() # Rollback changes if there is an error.
         print(f"Error processing documents: {e}")
     finally:
         if conn:
-            cur.close()
-            conn.close()
-
+            cur.close() # Close the cursor
+            conn.close() # Close the connection
 
 def split_into_sentences(text): # Replace with your actual sentence splitter
-    # Placeholder - Replace with your actual sentence splitting logic
+    """Placeholder - Replace with your actual sentence splitting logic."""
     return text.split(". ") # Example: Splitting by ". "
-
 
 # Example usage (REPLACE WITH YOUR DATA)
 documents = [
